@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# ==============================================================================
+# H5N1 HA Pipeline: Alignment, Variant Calling, and Annotation
+# ==============================================================================
+set -e # Exit immediately if a command exits with a non-zero status
+
+# 1. Setup Directories
+REF="HA_reference.fasta"
+INPUT_DIR="HA_sequence.fasta.split"
+ALIGN_DIR="HA_alignment"
+VCF_DIR="HA_vcf"
+ANNOT_DIR="HA_annotated"
+
+mkdir -p $INPUT_DIR $ALIGN_DIR $VCF_DIR $ANNOT_DIR
+
+# 2. Preprocessing: Split Multi-FASTA
+echo "--- Splitting FASTA files ---"
+seqkit split -i HA_aligned.fasta -O $INPUT_DIR
+
+# 3. Prepare Reference
+echo "--- Indexing Reference ---"
+bwa index $REF
+samtools faidx $REF
+
+# 4. Alignment & Sorting
+echo "--- Starting Alignment ---"
+for file in $INPUT_DIR/*.fasta; do
+    base=$(basename $file .fasta)
+    echo "Aligning $base..."
+    
+    bwa mem $REF $file | \
+    samtools view -Sb - | \
+    samtools sort -o $ALIGN_DIR/${base}_sorted.bam
+    
+    samtools index $ALIGN_DIR/${base}_sorted.bam
+done
+
+# 5. Variant Calling
+echo "--- Running FreeBayes ---"
+for bam in $ALIGN_DIR/*_sorted.bam; do
+    base=$(basename $bam _sorted.bam)
+    echo "Calling variants for $base..."
+    
+    freebayes -f $REF \
+        --haplotype-length 0 \
+        --min-alternate-count 1 \
+        --min-alternate-fraction 0.05 \
+        --pooled-continuous \
+        $bam > $VCF_DIR/${base}.vcf
+done
+
+# 6. Annotation
+echo "--- Running snpEff ---"
+for vcf in $VCF_DIR/*.vcf; do
+    base=$(basename $vcf .vcf)
+    snpEff ann H5N1_HA $vcf > $ANNOT_DIR/${base}_annotated.vcf
+done
+
+# 7. Extract Missense SNPs
+echo "--- Extracting Missense Variants ---"
+for f in $ANNOT_DIR/*_annotated.vcf; do
+    base=$(basename $f _annotated.vcf)
+    out_csv="${base}_missense_only.csv"
+    
+    echo "CHROM,POS,REF,ALT,EFFECT,IMPACT,GENE,AA_CHANGE" > $out_csv
+    
+    bcftools view -v snps -i 'ANN ~ "missense_variant" && ANN ~ "HA"' "$f" | \
+    bcftools query -f '%CHROM,%POS,%REF,%ALT,%INFO/ANN\n' | \
+    awk -F',' '{split($5,a,"|"); print $1","$2","$3","$4","a[2]","a[3]","a[4]","a[11]}' >> $out_csv
+done
+
+echo "--- Pipeline Complete ---"
